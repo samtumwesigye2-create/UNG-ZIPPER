@@ -1,11 +1,18 @@
 """UNG-ZIPPER national five-digit ZIP code registry."""
+from __future__ import annotations
+
+import json
+import os
+import urllib.request
+from datetime import datetime, timezone
+from typing import Optional, List
+
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, func
 from sqlalchemy.orm import Session
-from typing import Optional, List
 
-from db import Base, engine, get_db
+from db import Base, engine, get_db, SessionLocal
 from auth import require_admin_key
 from allocation import PopulationUnit, cluster_units_by_population, AREA_TYPE_RANGES
 
@@ -14,6 +21,17 @@ STANDARD_RANGE_START = 10000
 STANDARD_RANGE_END = 99999
 SPECIAL_RANGE_START = 1
 SPECIAL_RANGE_END = 999
+
+_SYNC_STATE = {
+    "attempted": False,
+    "ok": False,
+    "imported": 0,
+    "skipped": 0,
+    "error": None,
+    "source": None,
+    "synced_at": None,
+}
+
 
 class ZipCode(Base):
     __tablename__ = "zipper_codes"
@@ -31,7 +49,134 @@ class ZipCode(Base):
     flag = Column(String, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
+
 Base.metadata.create_all(bind=engine)
+
+
+def registry_count(db: Session | None = None) -> int:
+    own = db is None
+    session = db or SessionLocal()
+    try:
+        return int(session.query(ZipCode).count())
+    finally:
+        if own:
+            session.close()
+
+
+def sync_state() -> dict:
+    return {**_SYNC_STATE, "records": registry_count()}
+
+
+def _coords_centroid(geometry: dict | None):
+    coords = (geometry or {}).get("coordinates")
+    points = []
+
+    def walk(value):
+        if not isinstance(value, (list, tuple)):
+            return
+        if len(value) >= 2 and isinstance(value[0], (int, float)) and isinstance(value[1], (int, float)):
+            points.append((float(value[0]), float(value[1])))
+            return
+        for child in value:
+            walk(child)
+
+    walk(coords)
+    if not points:
+        return None, None
+    lon = sum(p[0] for p in points) / len(points)
+    lat = sum(p[1] for p in points) / len(points)
+    return lat, lon
+
+
+def bootstrap_from_ugamap(force: bool = False) -> dict:
+    """Import the live UGAMAP ZIPPER geography into the standalone registry.
+
+    This migrates the already-active map layer into UNG-ZIPPER instead of
+    inventing test ZIPs. Existing registry rows are preserved unless force is
+    explicitly requested, and duplicate codes are skipped.
+    """
+    base = os.environ.get("UGAMAP_ZIP_SYNC_URL", "").strip().rstrip("/")
+    _SYNC_STATE.update({"attempted": True, "source": base or None, "error": None})
+    if not base:
+        _SYNC_STATE.update({"ok": registry_count() > 0, "error": "UGAMAP_ZIP_SYNC_URL not configured"})
+        return sync_state()
+
+    db = SessionLocal()
+    try:
+        existing_count = db.query(ZipCode).count()
+        if existing_count and not force:
+            _SYNC_STATE.update({"ok": True, "imported": 0, "skipped": existing_count, "synced_at": datetime.now(timezone.utc).isoformat()})
+            return sync_state()
+
+        req = urllib.request.Request(f"{base}/geography/zipper", headers={"User-Agent": "UNG-ZIPPER/1.0"})
+        with urllib.request.urlopen(req, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        features = payload.get("features") or []
+        if not features:
+            raise RuntimeError("UGAMAP returned no ZIPPER geography features")
+
+        imported = 0
+        skipped = 0
+        for feature in features:
+            props = feature.get("properties") or {}
+            raw_code = props.get("zip_code") or props.get("zipper_id") or props.get("code")
+            code = str(raw_code or "").strip()
+            if not code.isdigit():
+                skipped += 1
+                continue
+            code = code.zfill(5)
+            numeric = int(code)
+            if not (STANDARD_RANGE_START <= numeric <= STANDARD_RANGE_END):
+                skipped += 1
+                continue
+            if db.query(ZipCode).filter(ZipCode.code == code).first():
+                skipped += 1
+                continue
+
+            lat, lon = _coords_centroid(feature.get("geometry"))
+            population = props.get("population")
+            try:
+                population = int(population) if population is not None else None
+            except (TypeError, ValueError):
+                population = None
+
+            district = str(props.get("district") or "").strip() or None
+            area_type = str(props.get("density_class") or props.get("area_type") or "rural").strip() or "rural"
+            state_code = str(props.get("state_code") or "").strip()
+            geometry_status = str(props.get("geometry_status") or "").strip()
+            flag_parts = [p for p in [geometry_status, f"state:{state_code}" if state_code else ""] if p]
+
+            db.add(ZipCode(
+                code=code,
+                district=district,
+                name=district,
+                category="ugamap_live_migration",
+                area_type=area_type,
+                population_covered=population,
+                unit_names=district,
+                latitude=lat,
+                longitude=lon,
+                protected=False,
+                flag="; ".join(flag_parts) or None,
+            ))
+            imported += 1
+
+        db.commit()
+        _SYNC_STATE.update({
+            "ok": imported > 0 or db.query(ZipCode).count() > 0,
+            "imported": imported,
+            "skipped": skipped,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return sync_state()
+    except Exception as exc:
+        db.rollback()
+        _SYNC_STATE.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return sync_state()
+    finally:
+        db.close()
+
 
 def _next_standard_code(db: Session) -> int:
     last = (
@@ -44,21 +189,25 @@ def _next_standard_code(db: Session) -> int:
         return max(int(last.code) + 1, STANDARD_RANGE_START)
     return STANDARD_RANGE_START
 
+
 class UnitIn(BaseModel):
     name: str
     population: int
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
+
 class GenerateIn(BaseModel):
     district: str
     area_type: str
     units: List[UnitIn]
 
+
 class SpecialCodeIn(BaseModel):
     code: str
     name: str
     category: str
+
 
 @router.post("/generate")
 def generate_codes(payload: GenerateIn, db: Session = Depends(get_db), _=Depends(require_admin_key)):
@@ -110,6 +259,7 @@ def generate_codes(payload: GenerateIn, db: Session = Depends(get_db), _=Depends
         "flagged_for_review": flagged,
     }
 
+
 @router.post("/special")
 def register_special_code(payload: SpecialCodeIn, db: Session = Depends(get_db), _=Depends(require_admin_key)):
     if not payload.code.isdigit() or not (SPECIAL_RANGE_START <= int(payload.code) <= SPECIAL_RANGE_END):
@@ -122,12 +272,24 @@ def register_special_code(payload: SpecialCodeIn, db: Session = Depends(get_db),
     db.commit()
     return {"code": record.code, "name": payload.name, "category": payload.category, "protected": True}
 
+
+@router.post("/sync/ugamap")
+def sync_from_ugamap(_=Depends(require_admin_key)):
+    return bootstrap_from_ugamap(force=True)
+
+
+@router.get("/sync/status")
+def get_sync_status():
+    return sync_state()
+
+
 @router.get("/validate/{code}")
 def validate_code(code: str, db: Session = Depends(get_db)):
     padded = code.zfill(5) if code.isdigit() else code
     exists = db.query(ZipCode).filter(ZipCode.code == padded).first() is not None
     well_formed = code.isdigit() and len(padded) == 5
-    return {"code": code, "well_formed": well_formed, "assigned": exists, "valid": well_formed and exists}
+    return {"code": padded if code.isdigit() else code, "well_formed": well_formed, "assigned": exists, "valid": well_formed and exists}
+
 
 @router.get("/district/{district}")
 def list_district_codes(district: str, db: Session = Depends(get_db)):
@@ -136,6 +298,7 @@ def list_district_codes(district: str, db: Session = Depends(get_db)):
         {"code": r.code, "area_type": r.area_type, "population_covered": r.population_covered, "flag": r.flag}
         for r in records
     ]
+
 
 @router.get("/")
 def search_codes(area_type: Optional[str] = None, flagged_only: bool = False, limit: int = 200, db: Session = Depends(get_db)):
@@ -156,6 +319,7 @@ def search_codes(area_type: Optional[str] = None, flagged_only: bool = False, li
         }
         for r in records
     ]
+
 
 @router.get("/{code}")
 def resolve_code(code: str, db: Session = Depends(get_db)):
