@@ -1,9 +1,9 @@
 """UNG-ZIPPER entrypoint."""
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from zipper import router as zipper_router
+from zipper import router as zipper_router, bootstrap_from_ugamap, sync_state
 
 app = FastAPI(
     title="UNG-ZIPPER",
@@ -19,10 +19,27 @@ app.add_middleware(
 
 app.include_router(zipper_router)
 
+
+@app.on_event("startup")
+def bootstrap_registry():
+    bootstrap_from_ugamap(force=False)
+
+
 @app.get("/")
 def root():
-    return {"service": "UNG-ZIPPER", "status": "ok"}
+    state = sync_state()
+    return {"service": "UNG-ZIPPER", "status": "ok" if state["records"] > 0 else "degraded", "records": state["records"]}
+
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    state = sync_state()
+    return {"status": "ok", "records": state["records"], "sync_ok": state["ok"]}
+
+
+@app.get("/ready")
+def ready():
+    state = sync_state()
+    if state["records"] <= 0:
+        raise HTTPException(status_code=503, detail={"status": "not_ready", **state})
+    return {"status": "ready", **state}
