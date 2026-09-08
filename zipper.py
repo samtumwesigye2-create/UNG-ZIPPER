@@ -21,6 +21,7 @@ STANDARD_RANGE_START = 10000
 STANDARD_RANGE_END = 99999
 SPECIAL_RANGE_START = 1
 SPECIAL_RANGE_END = 999
+DEFAULT_UGAMAP_SYNC_URL = "https://uganda-grid-api-clean-production.up.railway.app"
 
 _SYNC_STATE = {
     "attempted": False,
@@ -89,16 +90,16 @@ def _coords_centroid(geometry: dict | None):
 
 
 def bootstrap_from_ugamap(force: bool = False) -> dict:
-    """Import the live UGAMAP ZIPPER geography into the standalone registry.
+    """Import the active UGAMAP ZIPPER geography into the standalone registry.
 
     This migrates the already-active map layer into UNG-ZIPPER instead of
     inventing test ZIPs. Existing registry rows are preserved unless force is
     explicitly requested, and duplicate codes are skipped.
     """
-    base = os.environ.get("UGAMAP_ZIP_SYNC_URL", "").strip().rstrip("/")
+    base = os.environ.get("UGAMAP_ZIP_SYNC_URL", DEFAULT_UGAMAP_SYNC_URL).strip().rstrip("/")
     _SYNC_STATE.update({"attempted": True, "source": base or None, "error": None})
     if not base:
-        _SYNC_STATE.update({"ok": registry_count() > 0, "error": "UGAMAP_ZIP_SYNC_URL not configured"})
+        _SYNC_STATE.update({"ok": registry_count() > 0, "error": "UGAMAP ZIP sync URL not configured"})
         return sync_state()
 
     db = SessionLocal()
