@@ -2,6 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import threading
 
 from zipper import router as zipper_router, bootstrap_from_ugamap, sync_state
 
@@ -22,7 +23,7 @@ app.include_router(zipper_router)
 
 @app.on_event("startup")
 def bootstrap_registry():
-    bootstrap_from_ugamap(force=False)
+    threading.Thread(target=bootstrap_from_ugamap, kwargs={"force": False}, daemon=True).start()
 
 
 @app.get("/")
@@ -34,7 +35,7 @@ def root():
 @app.get("/health")
 def health():
     state = sync_state()
-    return {"status": "ok", "records": state["records"], "sync_ok": state["ok"]}
+    return {"status": "ok", "records": state["records"], "sync_ok": state["ok"], "sync_attempted": state["attempted"]}
 
 
 @app.get("/ready")
